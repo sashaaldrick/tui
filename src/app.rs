@@ -20,6 +20,8 @@ pub enum AppState {
     ConfirmOverwrite,
     Installing(InstallStep),
     Success,
+    TestMenu,      // New state for the test menu
+    RunningTest,   // New state for when test is running
     Finished,
 }
 
@@ -425,6 +427,20 @@ impl App {
                 self.status_message = String::from("Enter project name (press Enter when done):");
             }
             
+            (AppState::Success, KeyCode::Enter) => {
+                self.state = AppState::TestMenu;
+                self.status_message = String::from("Select test to run:");
+                self.command_output.clear();
+                return Ok(false);
+            }
+            (AppState::Success, _) => {
+                return Ok(false);
+            }
+            (AppState::TestMenu, KeyCode::Char('1')) => {
+                self.state = AppState::RunningTest;
+                self.run_e2e_test()?;
+                return Ok(false);
+            }
             _ => {}
         }
 
@@ -444,6 +460,89 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn run_e2e_test(&mut self) -> Result<()> {
+        self.add_output("Starting end-to-end test with Anvil...".to_string());
+        
+        // Change to project directory
+        std::env::set_current_dir(&self.project_name)?;
+        
+        // Create channels for stdout and stderr
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        
+        // Run the test script
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("./e2e-test-anvil.sh")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        
+        let stdout_reader = std::io::BufReader::new(stdout);
+        let stderr_reader = std::io::BufReader::new(stderr);
+        
+        use std::io::BufRead;
+        
+        // Spawn thread for stdout
+        let stdout_tx_clone = stdout_tx.clone();
+        std::thread::spawn(move || {
+            for line in stdout_reader.lines() {
+                if let Ok(line) = line {
+                    let _ = stdout_tx_clone.send(line);
+                }
+            }
+        });
+
+        // Spawn thread for stderr
+        let stderr_tx_clone = stderr_tx.clone();
+        std::thread::spawn(move || {
+            for line in stderr_reader.lines() {
+                if let Ok(line) = line {
+                    let _ = stderr_tx_clone.send(line);
+                }
+            }
+        });
+
+        // Process output in the main thread
+        let mut completed = false;
+        while !completed {
+            // Check stdout
+            if let Ok(line) = stdout_rx.try_recv() {
+                self.add_output(line);
+            }
+            
+            // Check stderr
+            if let Ok(line) = stderr_rx.try_recv() {
+                self.add_output(format!("Error: {}", line));
+            }
+            
+            // Check if process has finished
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    completed = true;
+                    if status.success() {
+                        self.add_output("End-to-end test completed successfully!".to_string());
+                    } else {
+                        self.add_output("End-to-end test failed!".to_string());
+                    }
+                }
+                Ok(None) => {
+                    // Process still running, wait a bit
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    self.add_output(format!("Error waiting for process: {}", e));
+                    completed = true;
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
@@ -535,11 +634,12 @@ impl App {
                     }
                 }
                 AppState::Success => {
-                    if event::poll(std::time::Duration::from_millis(50))? {
-                        if let Event::Key(_) = event::read()? {
-                            self.state = AppState::Finished;
-                        }
-                    }
+                    // Remove the automatic state transition on key press
+                    // The transition will now be handled in handle_key_event
+                }
+                AppState::RunningTest => {
+                    // Stay in this state while test is running
+                    // The test completion will be handled in run_e2e_test
                 }
                 AppState::Finished => break,
                 _ => {}
@@ -566,17 +666,30 @@ impl App {
         let inner_area = main_block.inner(area);
         frame.render_widget(main_block, area);
 
-        // Create a layout for status message and input
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(1), // Status message
-                Constraint::Length(1), // Input field
-                Constraint::Length(3), // Dependency status
-                Constraint::Min(0),    // Command output
-            ])
-            .split(inner_area);
+        // Modify the layout constraints when in Success state
+        let chunks = if let AppState::Success = self.state {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(1),     // Status message
+                    Constraint::Length(1),     // Input field
+                    Constraint::Ratio(1, 2),   // Success message gets half the remaining space
+                    Constraint::Ratio(1, 2),   // Command output gets the other half
+                ])
+                .split(inner_area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(1),     // Status message
+                    Constraint::Length(1),     // Input field
+                    Constraint::Length(3),     // Progress/menu area
+                    Constraint::Min(0),        // Command output
+                ])
+                .split(inner_area)
+        };
 
         // Render status message
         let status = Paragraph::new(self.status_message.clone());
@@ -658,20 +771,20 @@ impl App {
         // Add success message display
         if let AppState::Success = self.state {
             let success_text = vec![
+                Line::from(""),
                 Line::from("✨ Success! ✨").style(Style::default().fg(Color::Green).bold()),
                 Line::from(""),
                 Line::from(format!("Project '{}' has been created successfully!", self.project_name)),
                 Line::from(""),
-                Line::from("Next steps:"),
-                Line::from(format!("  cd {}", self.project_name)),
-                Line::from("  forge build"),
-                Line::from("  forge test"),
                 Line::from(""),
-                Line::from("Press any key to exit...").style(Style::default().fg(Color::Gray)),
+                Line::from(">>> PRESS ENTER TO CONTINUE <<<")
+                    .style(Style::default().fg(Color::Yellow).bold()),
+                Line::from(""),
             ];
             
             let success = Paragraph::new(success_text)
-                .block(Block::default().borders(Borders::NONE));
+                .block(Block::default().borders(Borders::NONE))
+                .alignment(Alignment::Center);
             frame.render_widget(success, chunks[2]);
         }
 
@@ -690,6 +803,20 @@ impl App {
                 .wrap(Wrap { trim: true });
             
             frame.render_widget(output, chunks[3]);
+        }
+
+        if let AppState::TestMenu = self.state {
+            let menu_text = vec![
+                Line::from("End-to-End Test Menu").style(Style::default().fg(Color::Green).bold()),
+                Line::from(""),
+                Line::from("1) Run test with local Anvil chain"),
+                Line::from(""),
+                Line::from("Press Esc to exit").style(Style::default().fg(Color::Gray)),
+            ];
+            
+            let menu = Paragraph::new(menu_text)
+                .block(Block::default().borders(Borders::NONE));
+            frame.render_widget(menu, chunks[2]);
         }
     }
 }
