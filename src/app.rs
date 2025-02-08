@@ -24,7 +24,8 @@ pub enum AppState {
     Installing(InstallStep),
     Success,
     TestMenu,
-    Testing(E2ETestStep), // Changed to use new test step enum
+    EnteringBonsaiKey, // New state for API key input
+    Testing(E2ETestStep),
     Finished,
 }
 
@@ -58,12 +59,15 @@ pub struct App {
     confirm_menu_item: usize,
     anvil_process: Option<std::process::Child>,
     test_env: Option<TestEnvironment>, // Add this to store test-related data
+    bonsai_api_key: String,            // Add this field
 }
 
 struct TestEnvironment {
     eth_rpc_url: String,
     eth_wallet_address: String,
     eth_wallet_private_key: String,
+    bonsai_api_key: String,
+    bonsai_api_url: String,
     anvil_process: Option<std::process::Child>,
 }
 
@@ -92,6 +96,7 @@ impl App {
             confirm_menu_item: 0,
             anvil_process: None,
             test_env: None,
+            bonsai_api_key: String::new(), // Add this field
         }
     }
 
@@ -551,136 +556,111 @@ impl App {
     }
 
     fn handle_test_step(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<()> {
-        let current_step = if let AppState::Testing(step) = &self.state {
-            step.clone()
-        } else {
-            return Ok(());
-        };
+        if let Some(test_env) = &self.test_env {
+            match self.state {
+                AppState::Testing(E2ETestStep::PreparingEnvironment) => {
+                    // Set environment variables
+                    std::env::set_var("ETH_RPC_URL", &test_env.eth_rpc_url);
+                    std::env::set_var("ETH_WALLET_ADDRESS", &test_env.eth_wallet_address);
+                    std::env::set_var("ETH_WALLET_PRIVATE_KEY", &test_env.eth_wallet_private_key);
+                    std::env::set_var("BONSAI_API_KEY", &test_env.bonsai_api_key);
+                    std::env::set_var("BONSAI_API_URL", &test_env.bonsai_api_url);
 
-        let mut messages = Vec::new();
+                    self.status_message =
+                        String::from("Environment variables set, starting Anvil...");
+                    self.state = AppState::Testing(E2ETestStep::StartingAnvil);
+                }
+                AppState::Testing(E2ETestStep::StartingAnvil) => {
+                    self.status_message = String::from("Starting local Ethereum chain...");
 
-        let next_state = match current_step {
-            E2ETestStep::PreparingEnvironment => {
-                messages.push("Setting up test environment...".to_string());
+                    // Kill any existing anvil process first
+                    let _ = Command::new("pkill").arg("anvil").output();
 
-                // Create test environment with standard Anvil test account
-                self.test_env = Some(TestEnvironment {
-                    eth_rpc_url: "http://localhost:8545".to_string(),
-                    eth_wallet_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
-                    eth_wallet_private_key:
-                        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-                            .to_string(),
-                    anvil_process: None,
-                });
+                    // Start new anvil process with test mnemonic
+                    if let Some(test_env) = &mut self.test_env {
+                        let child = Command::new("anvil")
+                            .args([
+                                "--mnemonic",
+                                "test test test test test test test test test test test test junk",
+                                "--silent",
+                            ])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()?;
 
-                messages.push("✓ Environment variables configured".to_string());
-                Some(AppState::Testing(E2ETestStep::StartingAnvil))
+                        test_env.anvil_process = Some(child);
+
+                        // Wait a moment for anvil to start
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+
+                        self.status_message = String::from("✓ Local Ethereum chain started");
+                        self.state = AppState::Testing(E2ETestStep::RunningTest);
+                    } else {
+                        return Err(color_eyre::eyre::eyre!("Test environment not initialized"));
+                    }
+                }
+                AppState::Testing(E2ETestStep::RunningTest) => {
+                    self.status_message = String::from("Running end-to-end test...");
+
+                    // Debug: Print current directory
+                    if let Ok(current_dir) = std::env::current_dir() {
+                        self.add_output(format!("Current directory: {:?}", current_dir));
+                    }
+
+                    // First make sure we're in the workspace root
+                    let workspace_root = std::path::PathBuf::from("/Users/sasha/Developer/tui");
+                    std::env::set_current_dir(&workspace_root)?;
+
+                    // Then change to project directory
+                    self.add_output(format!(
+                        "Changing to project directory: {}",
+                        self.project_name
+                    ));
+                    std::env::set_current_dir(&self.project_name)?;
+
+                    // Debug: Verify we're in the right place
+                    if let Ok(current_dir) = std::env::current_dir() {
+                        self.add_output(format!("New directory: {:?}", current_dir));
+                    }
+
+                    // List directory contents to debug
+                    if let Ok(entries) = std::fs::read_dir(".") {
+                        let files: Vec<_> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect();
+                        self.add_output(format!("Directory contents: {:?}", files));
+                    }
+
+                    // Check if the script exists
+                    if !std::path::Path::new("e2e-test.sh").exists() {
+                        self.add_output(
+                            "Error: e2e-test.sh not found in current directory".to_string(),
+                        );
+                        return Err(color_eyre::eyre::eyre!("e2e-test.sh script not found"));
+                    }
+
+                    // Run the script
+                    self.run_command(
+                        Command::new("bash")
+                            .arg("e2e-test.sh")
+                            .env("RUST_LOG", "info,risc0_steel=debug"),
+                        "Running end-to-end test script...",
+                        terminal,
+                    )?;
+
+                    self.status_message = String::from("✓ End-to-end test completed successfully");
+                    self.state = AppState::Testing(E2ETestStep::Cleanup);
+                }
+                AppState::Testing(E2ETestStep::Cleanup) => {
+                    self.status_message = String::from("Cleaning up...");
+                    self.cleanup_test();
+                    self.status_message = String::from("✓ Cleanup completed");
+                    self.state = AppState::TestMenu;
+                }
+                _ => {}
             }
-            E2ETestStep::StartingAnvil => {
-                messages.push("Starting local Ethereum chain...".to_string());
-
-                // Kill any existing anvil process first
-                let _ = Command::new("pkill").arg("anvil").output();
-
-                // Start new anvil process with test mnemonic
-                if let Some(test_env) = &mut self.test_env {
-                    let child = Command::new("anvil")
-                        .args([
-                            "--mnemonic",
-                            "test test test test test test test test test test test test junk",
-                            "--silent",
-                        ])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()?;
-
-                    test_env.anvil_process = Some(child);
-
-                    // Wait a moment for anvil to start
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-
-                    messages.push("✓ Local Ethereum chain started".to_string());
-                    Some(AppState::Testing(E2ETestStep::RunningTest))
-                } else {
-                    return Err(color_eyre::eyre::eyre!("Test environment not initialized"));
-                }
-            }
-            E2ETestStep::RunningTest => {
-                messages.push("Running end-to-end test...".to_string());
-
-                // Debug: Print current directory
-                if let Ok(current_dir) = std::env::current_dir() {
-                    messages.push(format!("Current directory: {:?}", current_dir));
-                }
-
-                // First make sure we're in the workspace root
-                let workspace_root = std::path::PathBuf::from("/Users/sasha/Developer/tui");
-                std::env::set_current_dir(&workspace_root)?;
-
-                // Then change to project directory
-                messages.push(format!(
-                    "Changing to project directory: {}",
-                    self.project_name
-                ));
-                std::env::set_current_dir(&self.project_name)?;
-
-                // Debug: Verify we're in the right place
-                if let Ok(current_dir) = std::env::current_dir() {
-                    messages.push(format!("New directory: {:?}", current_dir));
-                }
-
-                // List directory contents to debug
-                if let Ok(entries) = std::fs::read_dir(".") {
-                    let files: Vec<_> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect();
-                    messages.push(format!("Directory contents: {:?}", files));
-                }
-
-                // Set up environment variables
-                if let Some(env) = &self.test_env {
-                    std::env::set_var("ETH_RPC_URL", &env.eth_rpc_url);
-                    std::env::set_var("ETH_WALLET_ADDRESS", &env.eth_wallet_address);
-                    std::env::set_var("ETH_WALLET_PRIVATE_KEY", &env.eth_wallet_private_key);
-                }
-
-                // Check if the script exists
-                if !std::path::Path::new("e2e-test.sh").exists() {
-                    messages.push("Error: e2e-test.sh not found in current directory".to_string());
-                    return Err(color_eyre::eyre::eyre!("e2e-test.sh script not found"));
-                }
-
-                // Run the script
-                self.run_command(
-                    Command::new("bash")
-                        .arg("e2e-test.sh")
-                        .env("RUST_LOG", "info,risc0_steel=debug"),
-                    "Running end-to-end test script...",
-                    terminal,
-                )?;
-
-                messages.push("✓ End-to-end test completed successfully".to_string());
-                Some(AppState::Testing(E2ETestStep::Cleanup))
-            }
-            E2ETestStep::Cleanup => {
-                messages.push("Cleaning up...".to_string());
-                self.cleanup_test();
-                messages.push("✓ Cleanup completed".to_string());
-                Some(AppState::TestMenu)
-            }
-        };
-
-        // Add all collected messages
-        for msg in messages {
-            self.add_output(msg);
         }
-
-        // Update state if we got a new one
-        if let Some(new_state) = next_state {
-            self.state = new_state;
-        }
-
         Ok(())
     }
 
@@ -689,97 +669,115 @@ impl App {
             return Ok(false);
         }
 
-        match (&self.state, key.code) {
-            (_, KeyCode::Esc) => return Ok(true),
-
-            (AppState::EnteringProjectName, KeyCode::Enter) => {
-                if !self.project_name.is_empty() {
-                    if Path::new(&self.project_name).exists() {
-                        self.state = AppState::ConfirmOverwrite;
-                        self.status_message = String::from(""); // Remove the duplicate message
-                    } else {
-                        self.state = AppState::Installing(InstallStep::CloningRepo);
-                        self.status_message =
-                            format!("Installing project '{}'...", self.project_name);
+        match &self.state {
+            AppState::ConfirmOverwrite => match key.code {
+                KeyCode::Enter => {
+                    match self.confirm_menu_item {
+                        0 => {
+                            // Go to testing toolbox
+                            self.state = AppState::TestMenu;
+                            self.status_message = String::from("Select test to run:");
+                            self.command_output.clear();
+                        }
+                        1 => {
+                            // Continue (overwrite)
+                            self.state = AppState::Installing(InstallStep::CloningRepo);
+                            self.status_message =
+                                format!("Installing project '{}'...", self.project_name);
+                        }
+                        2 => {
+                            // Exit
+                            return Ok(true);
+                        }
+                        _ => {}
                     }
                 }
-            }
-
-            (AppState::EnteringProjectName, KeyCode::Char(c)) => {
-                self.project_name.push(c);
-            }
-
-            (AppState::EnteringProjectName, KeyCode::Backspace) => {
-                self.project_name.pop();
-            }
-
-            (AppState::ConfirmOverwrite, KeyCode::Up) => {
-                self.confirm_menu_item = self.confirm_menu_item.saturating_sub(1);
-                return Ok(false);
-            }
-
-            (AppState::ConfirmOverwrite, KeyCode::Down) => {
-                self.confirm_menu_item = (self.confirm_menu_item + 1).min(2); // 2 options (0, 1, 2)
-                return Ok(false);
-            }
-
-            (AppState::ConfirmOverwrite, KeyCode::Enter) => {
-                match self.confirm_menu_item {
-                    0 => {
-                        // Continue (overwrite)
-                        self.state = AppState::Installing(InstallStep::CloningRepo);
-                        self.status_message =
-                            format!("Installing project '{}'...", self.project_name);
-                    }
-                    1 => {
-                        // Go to testing toolbox
-                        self.state = AppState::TestMenu;
-                        self.status_message = String::from("Select test to run:");
-                        self.command_output.clear();
-                    }
-                    2 => {
-                        // Exit
-                        return Ok(true);
-                    }
-                    _ => {}
+                KeyCode::Up => {
+                    self.confirm_menu_item = self.confirm_menu_item.saturating_sub(1);
                 }
-                return Ok(false);
-            }
-
-            (AppState::Success, KeyCode::Enter) => {
-                self.state = AppState::TestMenu;
-                self.status_message = String::from("Select test to run:");
-                self.command_output.clear();
-                return Ok(false);
-            }
-            (AppState::Success, _) => {
-                return Ok(false);
-            }
-            (AppState::TestMenu, KeyCode::Up) => {
-                self.selected_menu_item = self.selected_menu_item.saturating_sub(1);
-                return Ok(false);
-            }
-            (AppState::TestMenu, KeyCode::Down) => {
-                self.selected_menu_item = (self.selected_menu_item + 1).min(1); // 1 is the last menu item
-                return Ok(false);
-            }
-            (AppState::TestMenu, KeyCode::Enter) => {
-                match self.selected_menu_item {
-                    0 => {
+                KeyCode::Down => {
+                    self.confirm_menu_item = (self.confirm_menu_item + 1).min(2);
+                }
+                KeyCode::Esc => return Ok(true),
+                _ => {}
+            },
+            AppState::Success => match key.code {
+                KeyCode::Enter => {
+                    self.state = AppState::TestMenu;
+                    self.status_message = String::from("Select test to run:");
+                    self.command_output.clear();
+                }
+                KeyCode::Esc => return Ok(true),
+                _ => {}
+            },
+            AppState::EnteringProjectName => match key.code {
+                KeyCode::Enter => {
+                    if !self.project_name.is_empty() {
+                        if Path::new(&self.project_name).exists() {
+                            self.state = AppState::ConfirmOverwrite;
+                            self.status_message = String::from("Directory exists. Overwrite?");
+                        } else {
+                            self.state = AppState::Installing(InstallStep::CloningRepo);
+                            self.status_message =
+                                format!("Installing project '{}'...", self.project_name);
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.project_name.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.project_name.pop();
+                }
+                KeyCode::Esc => return Ok(true),
+                _ => {}
+            },
+            AppState::TestMenu => match key.code {
+                KeyCode::Enter => {
+                    self.state = AppState::EnteringBonsaiKey;
+                    self.status_message = String::from("Please enter your Bonsai API key");
+                    self.bonsai_api_key.clear();
+                }
+                KeyCode::Up => {
+                    self.selected_menu_item = self.selected_menu_item.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.selected_menu_item = (self.selected_menu_item + 1).min(1);
+                }
+                KeyCode::Esc => return Ok(true),
+                _ => {}
+            },
+            AppState::EnteringBonsaiKey => {
+                match key.code {
+                    KeyCode::Enter if !self.bonsai_api_key.is_empty() => {
                         self.state = AppState::Testing(E2ETestStep::PreparingEnvironment);
-                        self.status_message = String::from("Running end-to-end test...");
+                        self.status_message = String::from("Starting end-to-end test...");
+                        self.test_env = Some(TestEnvironment {
+                            eth_rpc_url: String::from("http://localhost:8545"),
+                            eth_wallet_address: String::from("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+                            eth_wallet_private_key: String::from("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+                            bonsai_api_key: self.bonsai_api_key.clone(),
+                            bonsai_api_url: String::from("https://api.bonsai.xyz"),
+                            anvil_process: None,
+                        });
                     }
-                    1 => {
-                        self.state = AppState::Finished;
+                    KeyCode::Char(c) => {
+                        self.bonsai_api_key.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.bonsai_api_key.pop();
+                    }
+                    KeyCode::Esc => {
+                        self.state = AppState::TestMenu;
+                        self.status_message = String::from("Test cancelled");
                     }
                     _ => {}
                 }
-                return Ok(false);
             }
             _ => {}
         }
 
-        // Add scroll handling
+        // Handle scrolling for output
         match key.code {
             KeyCode::PageUp => {
                 if self.output_scroll > 0 {
@@ -911,259 +909,315 @@ impl App {
     /// - <https://docs.rs/ratatui/latest/ratatui/widgets/index.html>
     /// - <https://github.com/ratatui/ratatui/tree/master/examples>
     fn ui(&self, frame: &mut Frame) {
-        let area = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Status line
+                Constraint::Min(3),    // Main content
+                Constraint::Length(1), // Help text
+            ])
+            .split(frame.size());
 
-        let main_block = Block::default()
-            .title("Steel App Creator")
-            .borders(Borders::ALL);
-
-        let inner_area = main_block.inner(area);
-        frame.render_widget(main_block, area);
-
-        // Modify the layout constraints when in Success state
-        let chunks = match self.state {
-            AppState::Success => Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(1),   // Status message
-                    Constraint::Length(1),   // Input field
-                    Constraint::Ratio(1, 2), // Success message gets half the remaining space
-                    Constraint::Ratio(1, 2), // Command output gets the other half
-                ])
-                .split(inner_area),
-            AppState::TestMenu | AppState::ConfirmOverwrite => {
-                Layout::default() // Add ConfirmOverwrite here
-                    .direction(Direction::Vertical)
-                    .margin(1)
-                    .constraints([
-                        Constraint::Length(1),   // Status message
-                        Constraint::Length(1),   // Input field
-                        Constraint::Ratio(1, 2), // Menu gets half the remaining space
-                        Constraint::Ratio(1, 2), // Command output gets the other half
-                    ])
-                    .split(inner_area)
-            }
-            _ => Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(1), // Status message
-                    Constraint::Length(1), // Input field
-                    Constraint::Length(3), // Progress/menu area
-                    Constraint::Min(0),    // Command output
-                ])
-                .split(inner_area),
-        };
-
-        // Render status message
-        let status = Paragraph::new(self.status_message.clone());
+        // Render status line
+        let status = Paragraph::new(Line::from(vec![self.status_message.clone().bold()]));
         frame.render_widget(status, chunks[0]);
 
-        // Render input field when in EnteringProjectName state
-        if let AppState::EnteringProjectName = self.state {
-            let cursor_blink = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                / 500)
-                % 2
-                == 0;
+        match &self.state {
+            AppState::EnteringBonsaiKey => {
+                let cursor_blink = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    / 500)
+                    % 2
+                    == 0;
 
-            let input_text = format!(
-                "{}{}",
-                self.project_name,
-                if cursor_blink { "█" } else { " " }
-            );
+                let input_text = format!(
+                    "Bonsai API Key: {}{}",
+                    self.bonsai_api_key,
+                    if cursor_blink { "█" } else { " " }
+                );
 
-            let input_lines = vec![
-                Line::from(input_text).style(Style::default().fg(Color::Yellow)),
-                Line::from(""), // Add a blank line for spacing
-                Line::from("Press Esc to exit").style(Style::default().fg(Color::Gray)),
-            ];
+                let content = vec![
+                    Line::from(
+                        "Please enter your Bonsai API key to proceed with the end-to-end test.",
+                    ),
+                    Line::from("This key is required to authenticate with the Bonsai service."),
+                    Line::from(""),
+                    Line::from(input_text).style(Style::default().fg(Color::Yellow)),
+                    Line::from(""),
+                    Line::from("Press Enter to continue, Esc to cancel"),
+                ];
 
-            let input = Paragraph::new(input_lines).block(Block::default().borders(Borders::NONE));
-            frame.render_widget(input, chunks[1]);
-        }
+                let input_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Bonsai API Key Input");
 
-        // Show dependency status
-        if let AppState::CheckingDependencies = self.state {
-            let deps_status = vec![
-                format!("Rust: {}", if self.rust_installed { "✓" } else { "..." }),
-                format!(
-                    "Foundry: {}",
-                    if self.foundry_installed { "✓" } else { "..." }
-                ),
-                format!(
-                    "RISC0: {}",
-                    self.risc0_version.as_ref().map_or("...", |v| v)
-                ),
-            ]
-            .join("\n");
+                let input = Paragraph::new(content)
+                    .block(input_block)
+                    .wrap(Wrap { trim: true });
 
-            let deps = Paragraph::new(deps_status).style(Style::default().fg(Color::Gray));
-            frame.render_widget(deps, chunks[2]);
-        }
+                frame.render_widget(input, chunks[1]);
+            }
+            _ => {
+                let area = frame.area();
 
-        // Show installation progress when installing
-        if let AppState::Installing(step) = &self.state {
-            let (progress, details) = match step {
-                InstallStep::CloningRepo => (
-                    "Step 1/5: Downloading Template",
-                    format!("• Downloading RISC0 Ethereum template into '{}'\n• Using release-1.3 branch", self.project_name)
-                ),
-                InstallStep::SettingUpSparse => (
-                    "Step 2/5: Extracting ERC20 Counter Example",
-                    "• Configuring repository for minimal download\n• Extracting ERC20 counter example code".to_string()
-                ),
-                InstallStep::MovingFiles => (
-                    "Step 3/5: Setting Up Project Structure",
-                    "• Moving files to root directory\n• Creating standard project layout".to_string()
-                ),
-                InstallStep::UpdatingDependencies => (
-                    "Step 4/5: Configuring Dependencies",
-                    "• Updating Rust package dependencies\n• Setting up RISC0 and Ethereum integrations".to_string()
-                ),
-                InstallStep::SettingUpForge => (
-                    "Step 5/5: Installing Forge Components",
-                    "• Setting up Foundry development environment\n• Installing OpenZeppelin contracts\n• Configuring RISC0 Ethereum components".to_string()
-                ),
-            };
+                let main_block = Block::default()
+                    .title("Steel App Creator")
+                    .borders(Borders::ALL);
 
-            let progress_text = vec![
-                Line::from(progress).style(Style::default().fg(Color::Blue).bold()),
-                Line::from(""),
-                Line::from(details),
-            ];
+                let inner_area = main_block.inner(area);
+                frame.render_widget(main_block, area);
 
-            let progress_widget =
-                Paragraph::new(progress_text).block(Block::default().borders(Borders::NONE));
-            frame.render_widget(progress_widget, chunks[2]);
-        }
+                // Modify the layout constraints when in Success state
+                let chunks = match self.state {
+                    AppState::Success => Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints([
+                            Constraint::Length(1),   // Status message
+                            Constraint::Length(1),   // Input field
+                            Constraint::Ratio(1, 2), // Success message gets half the remaining space
+                            Constraint::Ratio(1, 2), // Command output gets the other half
+                        ])
+                        .split(inner_area),
+                    AppState::TestMenu | AppState::ConfirmOverwrite => {
+                        Layout::default() // Add ConfirmOverwrite here
+                            .direction(Direction::Vertical)
+                            .margin(1)
+                            .constraints([
+                                Constraint::Length(1),   // Status message
+                                Constraint::Length(1),   // Input field
+                                Constraint::Ratio(1, 2), // Menu gets half the remaining space
+                                Constraint::Ratio(1, 2), // Command output gets the other half
+                            ])
+                            .split(inner_area)
+                    }
+                    _ => Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints([
+                            Constraint::Length(1), // Status message
+                            Constraint::Length(1), // Input field
+                            Constraint::Length(3), // Progress/menu area
+                            Constraint::Min(0),    // Command output
+                        ])
+                        .split(inner_area),
+                };
 
-        // Add confirmation dialog display
-        if let AppState::ConfirmOverwrite = self.state {
-            let confirm_text = vec![
-                Line::from("Directory already exists!")
-                    .style(Style::default().fg(Color::Yellow).bold()),
-                Line::from(""),
-                Line::from("Use ↑↓ arrows to select, Enter to confirm:")
-                    .style(Style::default().fg(Color::Gray)),
-                Line::from(""),
-                Line::from(if self.confirm_menu_item == 0 {
-                    "▶ Continue (overwrite)"
-                } else {
-                    "  Continue (overwrite)"
-                })
-                .style(if self.confirm_menu_item == 0 {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                }),
-                Line::from(""), // Add spacing between options
-                Line::from(if self.confirm_menu_item == 1 {
-                    "▶ Go to testing toolbox"
-                } else {
-                    "  Go to testing toolbox"
-                })
-                .style(if self.confirm_menu_item == 1 {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                }),
-                Line::from(""), // Add spacing between options
-                Line::from(if self.confirm_menu_item == 2 {
-                    "▶ Exit"
-                } else {
-                    "  Exit"
-                })
-                .style(if self.confirm_menu_item == 2 {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                }),
-            ];
+                // Render status message
+                let status = Paragraph::new(self.status_message.clone());
+                frame.render_widget(status, chunks[0]);
 
-            let confirm =
-                Paragraph::new(confirm_text).block(Block::default().borders(Borders::NONE));
-            frame.render_widget(confirm, chunks[2]);
-        }
+                // Render input field when in EnteringProjectName state
+                if let AppState::EnteringProjectName = self.state {
+                    let cursor_blink = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                        / 500)
+                        % 2
+                        == 0;
 
-        // Add success message display
-        if let AppState::Success = self.state {
-            let success_text = vec![
-                Line::from(""),
-                Line::from("✨ Success! ✨").style(Style::default().fg(Color::Green).bold()),
-                Line::from(""),
-                Line::from(format!(
-                    "Project '{}' has been created successfully!",
-                    self.project_name
-                )),
-                Line::from(""),
-                Line::from(""),
-                Line::from(">>> PRESS ENTER TO CONTINUE <<<")
-                    .style(Style::default().fg(Color::Yellow).bold()),
-                Line::from(""),
-            ];
+                    let input_text = format!(
+                        "{}{}",
+                        self.project_name,
+                        if cursor_blink { "█" } else { " " }
+                    );
 
-            let success = Paragraph::new(success_text)
-                .block(Block::default().borders(Borders::NONE))
-                .alignment(Alignment::Center);
-            frame.render_widget(success, chunks[2]);
-        }
+                    let input_lines = vec![
+                        Line::from(input_text).style(Style::default().fg(Color::Yellow)),
+                        Line::from(""), // Add a blank line for spacing
+                        Line::from("Press Esc to exit").style(Style::default().fg(Color::Gray)),
+                    ];
 
-        // Show command output
-        if !self.command_output.is_empty() {
-            let output_text = self
-                .command_output
-                .iter()
-                .map(|line| Line::from(line.as_str()))
-                .collect::<Vec<_>>();
+                    let input =
+                        Paragraph::new(input_lines).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(input, chunks[1]);
+                }
 
-            let output = Paragraph::new(output_text)
-                .block(
-                    Block::default()
-                        .title("Command Output")
-                        .borders(Borders::ALL),
-                )
-                .scroll((self.output_scroll, 0))
-                .wrap(Wrap { trim: true });
+                // Show dependency status
+                if let AppState::CheckingDependencies = self.state {
+                    let deps_status = vec![
+                        format!("Rust: {}", if self.rust_installed { "✓" } else { "..." }),
+                        format!(
+                            "Foundry: {}",
+                            if self.foundry_installed { "✓" } else { "..." }
+                        ),
+                        format!(
+                            "RISC0: {}",
+                            self.risc0_version.as_ref().map_or("...", |v| v)
+                        ),
+                    ]
+                    .join("\n");
 
-            frame.render_widget(output, chunks[3]);
-        }
+                    let deps = Paragraph::new(deps_status).style(Style::default().fg(Color::Gray));
+                    frame.render_widget(deps, chunks[2]);
+                }
 
-        if let AppState::TestMenu = self.state {
-            let menu_text = vec![
-                Line::from("End-to-End Test Menu").style(Style::default().bold()),
-                Line::from(""),
-                Line::from("Use ↑↓ arrows to select, Enter to confirm:")
-                    .style(Style::default().fg(Color::Gray)),
-                Line::from(""),
-                Line::from(if self.selected_menu_item == 0 {
-                    "▶ 🔧 Run end-to-end test with Anvil"
-                } else {
-                    "  🔧 Run end-to-end test with Anvil"
-                })
-                .style(if self.selected_menu_item == 0 {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                }),
-                Line::from(""),
-                Line::from(if self.selected_menu_item == 1 {
-                    "▶ 🚪 Exit"
-                } else {
-                    "  🚪 Exit"
-                })
-                .style(if self.selected_menu_item == 1 {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                }),
-            ];
+                // Show installation progress when installing
+                if let AppState::Installing(step) = &self.state {
+                    let (progress, details) = match step {
+                        InstallStep::CloningRepo => (
+                            "Step 1/5: Downloading Template",
+                            format!("• Downloading RISC0 Ethereum template into '{}'\n• Using release-1.3 branch", self.project_name)
+                        ),
+                        InstallStep::SettingUpSparse => (
+                            "Step 2/5: Extracting ERC20 Counter Example",
+                            "• Configuring repository for minimal download\n• Extracting ERC20 counter example code".to_string()
+                        ),
+                        InstallStep::MovingFiles => (
+                            "Step 3/5: Setting Up Project Structure",
+                            "• Moving files to root directory\n• Creating standard project layout".to_string()
+                        ),
+                        InstallStep::UpdatingDependencies => (
+                            "Step 4/5: Configuring Dependencies",
+                            "• Updating Rust package dependencies\n• Setting up RISC0 and Ethereum integrations".to_string()
+                        ),
+                        InstallStep::SettingUpForge => (
+                            "Step 5/5: Installing Forge Components",
+                            "• Setting up Foundry development environment\n• Installing OpenZeppelin contracts\n• Configuring RISC0 Ethereum components".to_string()
+                        ),
+                    };
 
-            let menu = Paragraph::new(menu_text).block(Block::default().borders(Borders::NONE));
-            frame.render_widget(menu, chunks[2]);
+                    let progress_text = vec![
+                        Line::from(progress).style(Style::default().fg(Color::Blue).bold()),
+                        Line::from(""),
+                        Line::from(details),
+                    ];
+
+                    let progress_widget = Paragraph::new(progress_text)
+                        .block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(progress_widget, chunks[2]);
+                }
+
+                // Add confirmation dialog display
+                if let AppState::ConfirmOverwrite = self.state {
+                    let confirm_text = vec![
+                        Line::from("Directory already exists!")
+                            .style(Style::default().fg(Color::Yellow).bold()),
+                        Line::from(""),
+                        Line::from("Use ↑↓ arrows to select, Enter to confirm:")
+                            .style(Style::default().fg(Color::Gray)),
+                        Line::from(""),
+                        Line::from(if self.confirm_menu_item == 0 {
+                            "▶ Go to testing toolbox"
+                        } else {
+                            "  Go to testing toolbox"
+                        })
+                        .style(if self.confirm_menu_item == 0 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""), // Add spacing between options
+                        Line::from(if self.confirm_menu_item == 1 {
+                            "▶ Continue (overwrite)"
+                        } else {
+                            "  Continue (overwrite)"
+                        })
+                        .style(if self.confirm_menu_item == 1 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""), // Add spacing between options
+                        Line::from(if self.confirm_menu_item == 2 {
+                            "▶ Exit"
+                        } else {
+                            "  Exit"
+                        })
+                        .style(if self.confirm_menu_item == 2 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                    ];
+
+                    let confirm =
+                        Paragraph::new(confirm_text).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(confirm, chunks[2]);
+                }
+
+                // Add success message display
+                if let AppState::Success = self.state {
+                    let success_text = vec![
+                        Line::from(""),
+                        Line::from("✨ Success! ✨")
+                            .style(Style::default().fg(Color::Green).bold()),
+                        Line::from(""),
+                        Line::from(format!(
+                            "Project '{}' has been created successfully!",
+                            self.project_name
+                        )),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(">>> PRESS ENTER TO CONTINUE <<<")
+                            .style(Style::default().fg(Color::Yellow).bold()),
+                        Line::from(""),
+                    ];
+
+                    let success = Paragraph::new(success_text)
+                        .block(Block::default().borders(Borders::NONE))
+                        .alignment(Alignment::Center);
+                    frame.render_widget(success, chunks[2]);
+                }
+
+                // Show command output
+                if !self.command_output.is_empty() {
+                    let output_text = self
+                        .command_output
+                        .iter()
+                        .map(|line| Line::from(line.as_str()))
+                        .collect::<Vec<_>>();
+
+                    let output = Paragraph::new(output_text)
+                        .block(
+                            Block::default()
+                                .title("Command Output")
+                                .borders(Borders::ALL),
+                        )
+                        .scroll((self.output_scroll, 0))
+                        .wrap(Wrap { trim: true });
+
+                    frame.render_widget(output, chunks[3]);
+                }
+
+                if let AppState::TestMenu = self.state {
+                    let menu_text = vec![
+                        Line::from("End-to-End Test Menu").style(Style::default().bold()),
+                        Line::from(""),
+                        Line::from("Use ↑↓ arrows to select, Enter to confirm:")
+                            .style(Style::default().fg(Color::Gray)),
+                        Line::from(""),
+                        Line::from(if self.selected_menu_item == 0 {
+                            "▶ 🔧 Run end-to-end test with Anvil"
+                        } else {
+                            "  🔧 Run end-to-end test with Anvil"
+                        })
+                        .style(if self.selected_menu_item == 0 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""),
+                        Line::from(if self.selected_menu_item == 1 {
+                            "▶ 🚪 Exit"
+                        } else {
+                            "  🚪 Exit"
+                        })
+                        .style(if self.selected_menu_item == 1 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                    ];
+
+                    let menu =
+                        Paragraph::new(menu_text).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(menu, chunks[2]);
+                }
+            }
         }
     }
 }
