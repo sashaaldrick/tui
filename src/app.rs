@@ -99,9 +99,8 @@ impl App {
     }
 
     fn add_output(&mut self, output: String) {
+        // Just add the raw line to the output
         self.command_output.push(output);
-        // Auto-scroll to bottom when new output is added
-        self.output_scroll = self.command_output.len().saturating_sub(1) as u16;
         self.pending_redraw = true;
     }
 
@@ -113,9 +112,8 @@ impl App {
     ) -> Result<()> {
         self.status_message = description.to_string();
 
-        // Clear previous output when starting a new command
-        self.command_output.clear();
-        self.output_scroll = 0;
+        // Force a redraw before running the command
+        terminal.draw(|frame| self.ui(frame))?;
 
         // Configure the command with piped output
         command.stdout(std::process::Stdio::piped());
@@ -125,7 +123,7 @@ impl App {
 
         use std::io::{BufRead, BufReader};
 
-        // Handle stdout and stderr concurrently
+        // Handle stdout
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -136,6 +134,7 @@ impl App {
             }
         }
 
+        // Handle stderr
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
@@ -150,6 +149,9 @@ impl App {
         if !status.success() {
             return Err(color_eyre::eyre::eyre!("Command failed"));
         }
+
+        // Force another redraw after adding output
+        terminal.draw(|frame| self.ui(frame))?;
 
         Ok(())
     }
@@ -695,26 +697,6 @@ impl App {
             return Ok(false);
         }
 
-        match key.code {
-            KeyCode::PageUp => {
-                if self.output_scroll > 0 {
-                    self.output_scroll = self.output_scroll.saturating_sub(1);
-                    self.pending_redraw = true;
-                }
-            }
-            KeyCode::PageDown => {
-                if !self.command_output.is_empty() {
-                    self.output_scroll = self
-                        .output_scroll
-                        .saturating_add(1)
-                        .min((self.command_output.len() as u16).saturating_sub(1));
-                    self.pending_redraw = true;
-                }
-            }
-            KeyCode::Esc => return Ok(true),
-            _ => {}
-        }
-
         match &self.state {
             AppState::ConfirmOverwrite => match key.code {
                 KeyCode::Enter => {
@@ -828,6 +810,21 @@ impl App {
                         self.status_message = String::from("Test cancelled");
                     }
                     _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        // Handle scrolling for output
+        match key.code {
+            KeyCode::PageUp => {
+                if self.output_scroll > 0 {
+                    self.output_scroll = self.output_scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if !self.command_output.is_empty() {
+                    self.output_scroll = self.output_scroll.saturating_add(1);
                 }
             }
             _ => {}
@@ -950,33 +947,339 @@ impl App {
     /// - <https://docs.rs/ratatui/latest/ratatui/widgets/index.html>
     /// - <https://github.com/ratatui/ratatui/tree/master/examples>
     fn ui(&self, frame: &mut Frame) {
-        // Create a simple two-panel layout: status at top, main content below
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Status area
-                Constraint::Min(10),   // Main content
+                Constraint::Length(1), // Status line
+                Constraint::Min(3),    // Main content
+                Constraint::Length(1), // Help text
             ])
             .split(frame.area());
 
         // Render status line
-        let status = Paragraph::new(Line::from(vec![self.status_message.clone().bold()]))
-            .block(Block::default().borders(Borders::ALL));
+        let status = Paragraph::new(Line::from(vec![self.status_message.clone().bold()]));
         frame.render_widget(status, chunks[0]);
 
-        // Render command output with simple scrolling
-        if !self.command_output.is_empty() {
-            let output_text = self
-                .command_output
-                .iter()
-                .map(|line| Line::from(line.as_str()))
-                .collect::<Vec<_>>();
+        match &self.state {
+            AppState::EnteringBonsaiKey => {
+                let cursor_blink = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    / 500)
+                    % 2
+                    == 0;
 
-            let output = Paragraph::new(output_text)
-                .block(Block::default().borders(Borders::ALL))
-                .scroll((self.output_scroll, 0));
+                let input_text = format!(
+                    "Bonsai API Key: {}{}",
+                    self.bonsai_api_key,
+                    if cursor_blink { "█" } else { " " }
+                );
 
-            frame.render_widget(output, chunks[1]);
+                let content = vec![
+                    Line::from(
+                        "Please enter your Bonsai API key to proceed with the end-to-end test.",
+                    ),
+                    Line::from("This key is required to authenticate with the Bonsai service."),
+                    Line::from(""),
+                    Line::from(input_text).style(Style::default().fg(Color::Yellow)),
+                    Line::from(""),
+                    Line::from("Press Enter to continue, Esc to cancel"),
+                ];
+
+                let input_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Bonsai API Key Input");
+
+                let input = Paragraph::new(content)
+                    .block(input_block)
+                    .wrap(Wrap { trim: true });
+
+                frame.render_widget(input, chunks[1]);
+            }
+            _ => {
+                let area = frame.area();
+
+                let main_block = Block::default()
+                    .title("Steel App Creator")
+                    .borders(Borders::ALL);
+
+                let inner_area = main_block.inner(area);
+                frame.render_widget(main_block, area);
+
+                // Modify the layout constraints when in Success state
+                let chunks = match self.state {
+                    AppState::Success => Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints([
+                            Constraint::Length(1),   // Status message
+                            Constraint::Length(1),   // Input field
+                            Constraint::Ratio(1, 2), // Success message gets half the remaining space
+                            Constraint::Ratio(1, 2), // Command output gets the other half
+                        ])
+                        .split(inner_area),
+                    AppState::TestMenu | AppState::ConfirmOverwrite => {
+                        Layout::default() // Add ConfirmOverwrite here
+                            .direction(Direction::Vertical)
+                            .margin(1)
+                            .constraints([
+                                Constraint::Length(1),   // Status message
+                                Constraint::Length(1),   // Input field
+                                Constraint::Ratio(1, 2), // Menu gets half the remaining space
+                                Constraint::Ratio(1, 2), // Command output gets the other half
+                            ])
+                            .split(inner_area)
+                    }
+                    _ => Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints([
+                            Constraint::Length(1), // Status message
+                            Constraint::Length(1), // Input field
+                            Constraint::Length(3), // Progress/menu area
+                            Constraint::Min(0),    // Command output
+                        ])
+                        .split(inner_area),
+                };
+
+                // Render status message
+                let status = Paragraph::new(self.status_message.clone());
+                frame.render_widget(status, chunks[0]);
+
+                // Render input field when in EnteringProjectName state
+                if let AppState::EnteringProjectName = self.state {
+                    let cursor_blink = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                        / 500)
+                        % 2
+                        == 0;
+
+                    let input_text = format!(
+                        "{}{}",
+                        self.project_name,
+                        if cursor_blink { "█" } else { " " }
+                    );
+
+                    let input_lines = vec![
+                        Line::from(input_text).style(Style::default().fg(Color::Yellow)),
+                        Line::from(""), // Add a blank line for spacing
+                        Line::from("Press Esc to exit").style(Style::default().fg(Color::Gray)),
+                    ];
+
+                    let input =
+                        Paragraph::new(input_lines).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(input, chunks[1]);
+                }
+
+                // Show dependency status
+                if let AppState::CheckingDependencies = self.state {
+                    let deps_status = vec![
+                        format!("Rust: {}", if self.rust_installed { "✓" } else { "..." }),
+                        format!(
+                            "Foundry: {}",
+                            if self.foundry_installed { "✓" } else { "..." }
+                        ),
+                        format!(
+                            "RISC0: {}",
+                            self.risc0_version.as_ref().map_or("...", |v| v)
+                        ),
+                    ]
+                    .join("\n");
+
+                    let deps = Paragraph::new(deps_status).style(Style::default().fg(Color::Gray));
+                    frame.render_widget(deps, chunks[2]);
+                }
+
+                // Show installation progress when installing
+                if let AppState::Installing(step) = &self.state {
+                    let (progress, details) = match step {
+                        InstallStep::CloningRepo => (
+                            "Step 1/5: Downloading Template",
+                            format!("• Downloading RISC0 Ethereum template into '{}'\n• Using release-1.3 branch", self.project_name)
+                        ),
+                        InstallStep::SettingUpSparse => (
+                            "Step 2/5: Extracting ERC20 Counter Example",
+                            "• Configuring repository for minimal download\n• Extracting ERC20 counter example code".to_string()
+                        ),
+                        InstallStep::MovingFiles => (
+                            "Step 3/5: Setting Up Project Structure",
+                            "• Moving files to root directory\n• Creating standard project layout".to_string()
+                        ),
+                        InstallStep::UpdatingDependencies => (
+                            "Step 4/5: Configuring Dependencies",
+                            "• Updating Rust package dependencies\n• Setting up RISC0 and Ethereum integrations".to_string()
+                        ),
+                        InstallStep::SettingUpForge => (
+                            "Step 5/5: Installing Forge Components",
+                            "• Setting up Foundry development environment\n• Installing OpenZeppelin contracts\n• Configuring RISC0 Ethereum components".to_string()
+                        ),
+                    };
+
+                    let progress_text = vec![
+                        Line::from(progress).style(Style::default().fg(Color::Blue).bold()),
+                        Line::from(""),
+                        Line::from(details),
+                    ];
+
+                    let progress_widget = Paragraph::new(progress_text)
+                        .block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(progress_widget, chunks[2]);
+                }
+
+                // Add confirmation dialog display
+                if let AppState::ConfirmOverwrite = self.state {
+                    let confirm_text = vec![
+                        Line::from("Directory already exists!")
+                            .style(Style::default().fg(Color::Yellow).bold()),
+                        Line::from(""),
+                        Line::from("Use ↑↓ arrows to select, Enter to confirm:")
+                            .style(Style::default().fg(Color::Gray)),
+                        Line::from(""),
+                        Line::from(if self.confirm_menu_item == 0 {
+                            "▶ Go to testing toolbox"
+                        } else {
+                            "  Go to testing toolbox"
+                        })
+                        .style(if self.confirm_menu_item == 0 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""), // Add spacing between options
+                        Line::from(if self.confirm_menu_item == 1 {
+                            "▶ Continue (overwrite)"
+                        } else {
+                            "  Continue (overwrite)"
+                        })
+                        .style(if self.confirm_menu_item == 1 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""), // Add spacing between options
+                        Line::from(if self.confirm_menu_item == 2 {
+                            "▶ Exit"
+                        } else {
+                            "  Exit"
+                        })
+                        .style(if self.confirm_menu_item == 2 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                    ];
+
+                    let confirm =
+                        Paragraph::new(confirm_text).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(confirm, chunks[2]);
+                }
+
+                // Add success message display
+                if let AppState::Success = self.state {
+                    let success_text = vec![
+                        Line::from(""),
+                        Line::from("✨ Success! ✨")
+                            .style(Style::default().fg(Color::Green).bold()),
+                        Line::from(""),
+                        Line::from(format!(
+                            "Project '{}' has been created successfully!",
+                            self.project_name
+                        )),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(">>> PRESS ENTER TO CONTINUE <<<")
+                            .style(Style::default().fg(Color::Yellow).bold()),
+                        Line::from(""),
+                    ];
+
+                    let success = Paragraph::new(success_text)
+                        .block(Block::default().borders(Borders::NONE))
+                        .alignment(Alignment::Center);
+                    frame.render_widget(success, chunks[2]);
+                }
+
+                // Show command output
+                if !self.command_output.is_empty() {
+                    let output_text = self
+                        .command_output
+                        .iter()
+                        .map(|line| Line::from(line.as_str()))
+                        .collect::<Vec<_>>();
+
+                    let output = Paragraph::new(output_text)
+                        .block(
+                            Block::default()
+                                .title("Command Output")
+                                .borders(Borders::ALL),
+                        )
+                        .wrap(Wrap { trim: true })
+                        .scroll((self.output_scroll, 0));
+
+                    frame.render_widget(output, chunks[3]);
+
+                    // Add scroll indicator if there's more content
+                    if self.output_scroll > 0 {
+                        frame.render_widget(
+                            Paragraph::new("↑ More above (PgUp/PgDn to scroll)")
+                                .alignment(Alignment::Center)
+                                .style(Style::default().fg(Color::DarkGray)),
+                            chunks[3].inner(Margin {
+                                vertical: 0,
+                                horizontal: 1,
+                            }),
+                        );
+                    }
+                    if (self.output_scroll as usize) < self.command_output.len().saturating_sub(1) {
+                        frame.render_widget(
+                            Paragraph::new("↓ More below (PgUp/PgDn to scroll)")
+                                .alignment(Alignment::Center)
+                                .style(Style::default().fg(Color::DarkGray)),
+                            chunks[3].inner(Margin {
+                                vertical: 2,
+                                horizontal: 1,
+                            }),
+                        );
+                    }
+                }
+
+                if let AppState::TestMenu = self.state {
+                    let menu_text = vec![
+                        Line::from("End-to-End Test Menu").style(Style::default().bold()),
+                        Line::from(""),
+                        Line::from("Use ↑↓ arrows to select, Enter to confirm:")
+                            .style(Style::default().fg(Color::Gray)),
+                        Line::from(""),
+                        Line::from(if self.selected_menu_item == 0 {
+                            "▶ 🔧 Run end-to-end test with Anvil"
+                        } else {
+                            "  🔧 Run end-to-end test with Anvil"
+                        })
+                        .style(if self.selected_menu_item == 0 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                        Line::from(""),
+                        Line::from(if self.selected_menu_item == 1 {
+                            "▶ 🚪 Exit"
+                        } else {
+                            "  🚪 Exit"
+                        })
+                        .style(if self.selected_menu_item == 1 {
+                            Style::default().fg(Color::Yellow).bold()
+                        } else {
+                            Style::default()
+                        }),
+                    ];
+
+                    let menu =
+                        Paragraph::new(menu_text).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(menu, chunks[2]);
+                }
+            }
         }
     }
 }
